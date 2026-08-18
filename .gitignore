@@ -1,0 +1,5 @@
+.gleedos-*/
+downloads/
+gleedos
+cmd/gleedos/*.bak.*
+cmd/gleedos/*.before-restore.*
