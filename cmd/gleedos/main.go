@@ -1,11 +1,22 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
+	"time"
+
+	"github.com/krtvysingh/gleedos/pkg/batch"
+	"github.com/krtvysingh/gleedos/pkg/limiter"
+	"github.com/krtvysingh/gleedos/pkg/server"
+	"github.com/krtvysingh/gleedos/pkg/tagger"
+	"github.com/krtvysingh/gleedos/pkg/watcher"
 )
 
 const banner = `
@@ -16,40 +27,34 @@ const banner = `
  ╚██████╔╝███████╗███████╗██████╔╝╚██████╔╝██████╔╝███████║
   ╚═════╝ ╚══════╝╚══════╝╚═════╝  ╚═════╝  ╚═════╝ ╚══════╝
 
-  Universal terminal downloader
+  Universal terminal downloader & zero-dependency media engine
 `
 
 func printUsage() {
 	fmt.Print(`Gleedos — Universal terminal downloader
 
 Usage:
-  gleedos <URL>
-  gleedos <URL> --best
-  gleedos <URL> --audio
-  gleedos <URL> --format mp4
-  gleedos <URL> --turbo
-  gleedos <URL> --list-formats
-  gleedos <URL> -o <path>
+  gleedos <URL> [options]
+  gleedos --batch <urls.txt> [options]
+  gleedos --watch
+  gleedos serve [--port 8080]
+  gleedos history
 
 Options:
-  --best            Best available quality
-  --audio           Extract audio as MP3
-  --format <ext>    Prefer output format/container
-  --turbo           Increase concurrent fragments
-  --list-formats    Show all formats available from yt-dlp
-  -o, --output      Output directory/path
-  -h, --help        Show this help
+  --best                    Best available quality
+  --audio                   Extract audio as MP3
+  --format <ext>            Prefer output format/container
+  --turbo                   Increase concurrent fragments
+  --threads <n>             Number of parallel download threads (default: 4)
+  --limit-rate <rate>       Bandwidth limit (e.g. 5M, 500K, 10MB)
+  --cookies <file>          Path to Netscape cookies file
+  --cookies-from-browser <b> Extract cookies from browser (chrome, safari, firefox)
+  --subs <lang>             Download subtitles (e.g. en,es)
+  --list-formats            Show all formats available from yt-dlp
+  -o, --output <path>       Output directory/path
+  -j, --concurrency <n>     Batch worker concurrency (default: 3)
+  -h, --help                Show this help
 `)
-}
-
-func die(format string, args ...any) {
-	fmt.Fprintf(os.Stderr, "Gleedos: "+format+"\n", args...)
-	os.Exit(1)
-}
-
-func validURL(url string) bool {
-	return strings.HasPrefix(url, "http://") ||
-		strings.HasPrefix(url, "https://")
 }
 
 func main() {
@@ -67,27 +72,126 @@ func main() {
 		os.Exit(0)
 	}
 
-	url := cliArgs[0]
-
-	if !strings.HasPrefix(url, "http://") &&
-		!strings.HasPrefix(url, "https://") {
-		fmt.Fprintln(os.Stderr, "Gleedos: invalid URL")
-		os.Exit(1)
-	}
-
 	home, err := os.UserHomeDir()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Gleedos:", err)
 		os.Exit(1)
 	}
 
+	store, _ := batch.NewHistoryStore(filepath.Join(home, ".gleedos", "history.json"))
+
+	// Subcommand: history
+	if cliArgs[0] == "history" {
+		if store == nil {
+			fmt.Println("No history found.")
+			return
+		}
+		records := store.GetAll()
+		fmt.Printf("Gleedos Download History (%d items):\n\n", len(records))
+		for i, r := range records {
+			status := "✓ SUCCESS"
+			if !r.Success {
+				status = "✗ FAILED"
+			}
+			fmt.Printf("[%d] %s | %s | %s\n    Path: %s\n", i+1, status, r.CompletedAt.Format("2006-01-02 15:04:05"), r.URL, r.OutputPath)
+		}
+		return
+	}
+
+	// Subcommand: serve
+	if cliArgs[0] == "serve" {
+		port := 8080
+		for i := 1; i < len(cliArgs); i++ {
+			if cliArgs[i] == "--port" && i+1 < len(cliArgs) {
+				p, _ := strconv.Atoi(cliArgs[i+1])
+				if p > 0 {
+					port = p
+				}
+				i++
+			}
+		}
+
+		fmt.Print(banner)
+		fmt.Printf("  Starting Gleedos REST API on http://127.0.0.1:%d\n", port)
+		fmt.Println("  Endpoints:")
+		fmt.Println("    POST /api/download")
+		fmt.Println("    GET  /api/status?id=<job_id>")
+		fmt.Println("    GET  /api/history")
+		fmt.Println("    GET  /health")
+		fmt.Println()
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		srv := server.New(port, func(ctx context.Context, req server.DownloadRequest) (string, error) {
+			outDir := req.OutputPath
+			if outDir == "" {
+				outDir = filepath.Join(home, "Downloads", "Gleedos")
+			}
+			return downloadMedia(ctx, req.URL, outDir, req.AudioMode, req.Best, req.Turbo, req.Format, 4, nil, "", "", "")
+		}, store)
+
+		if err := srv.Start(ctx); err != nil {
+			fmt.Fprintf(os.Stderr, "Gleedos Server Error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Subcommand: --watch
+	if cliArgs[0] == "--watch" {
+		fmt.Print(banner)
+		fmt.Println("  Clipboard Watcher Active. Copy any video/media URL to download.")
+		fmt.Printf("  Output: %s\n\n", filepath.Join(home, "Downloads", "Gleedos"))
+
+		ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer cancel()
+
+		outDir := filepath.Join(home, "Downloads", "Gleedos")
+		w := watcher.New(1*time.Second, func(u string) {
+			fmt.Printf("\n[Watcher] Detected URL: %s\n", u)
+			if store != nil && store.HasURL(u) {
+				fmt.Printf("[Watcher] URL already downloaded, skipping: %s\n", u)
+				return
+			}
+			outPath, err := downloadMedia(context.Background(), u, outDir, false, false, false, "", 4, nil, "", "", "")
+			if err != nil {
+				fmt.Printf("[Watcher] Error downloading %s: %v\n", u, err)
+			} else {
+				fmt.Printf("[Watcher] Finished: %s\n", outPath)
+			}
+		})
+
+		w.Start(ctx)
+		return
+	}
+
+	// Batch Mode
+	var batchFile string
 	outputDir := filepath.Join(home, "Downloads", "Gleedos")
 	quality := "bv*[height<=1080]+ba/b[height<=1080]/b[ext=mp4]/b"
 	audioMode := false
 	turbo := false
+	threads := 4
+	concurrency := 3
+	var rateLim *limiter.RateLimiter
+	var cookiesFile string
+	var cookiesBrowser string
+	var subLangs string
+	var preferredFormat string
 
-	for i := 1; i < len(cliArgs); i++ {
+	url := ""
+
+	for i := 0; i < len(cliArgs); i++ {
 		switch cliArgs[i] {
+		case "--batch":
+			if i+1 >= len(cliArgs) {
+				fmt.Fprintln(os.Stderr, "Gleedos: --batch requires file path")
+				os.Exit(1)
+			}
+			i++
+			batchFile = cliArgs[i]
+
 		case "--best":
 			quality = "bv*+ba/b[ext=mp4]/b"
 
@@ -96,6 +200,52 @@ func main() {
 
 		case "--turbo":
 			turbo = true
+			threads = 8
+
+		case "--threads":
+			if i+1 < len(cliArgs) {
+				i++
+				threads, _ = strconv.Atoi(cliArgs[i])
+				if threads <= 0 {
+					threads = 4
+				}
+			}
+
+		case "-j", "--concurrency":
+			if i+1 < len(cliArgs) {
+				i++
+				concurrency, _ = strconv.Atoi(cliArgs[i])
+				if concurrency <= 0 {
+					concurrency = 3
+				}
+			}
+
+		case "--limit-rate":
+			if i+1 < len(cliArgs) {
+				i++
+				rateBytes, _ := limiter.ParseRate(cliArgs[i])
+				if rateBytes > 0 {
+					rateLim = limiter.New(rateBytes)
+				}
+			}
+
+		case "--cookies":
+			if i+1 < len(cliArgs) {
+				i++
+				cookiesFile = cliArgs[i]
+			}
+
+		case "--cookies-from-browser":
+			if i+1 < len(cliArgs) {
+				i++
+				cookiesBrowser = cliArgs[i]
+			}
+
+		case "--subs":
+			if i+1 < len(cliArgs) {
+				i++
+				subLangs = cliArgs[i]
+			}
 
 		case "--format":
 			if i+1 >= len(cliArgs) {
@@ -103,13 +253,8 @@ func main() {
 				os.Exit(1)
 			}
 			i++
-			format := cliArgs[i]
-			quality = fmt.Sprintf(
-				"bv*[ext=%s]+ba/b[ext=%s]/b[ext=%s]",
-				format,
-				format,
-				format,
-			)
+			preferredFormat = cliArgs[i]
+			quality = fmt.Sprintf("bv*[ext=%s]+ba/b[ext=%s]/b[ext=%s]", preferredFormat, preferredFormat, preferredFormat)
 
 		case "-o", "--output":
 			if i+1 >= len(cliArgs) {
@@ -120,25 +265,59 @@ func main() {
 			outputDir = cliArgs[i]
 
 		case "--list-formats":
-			cmd := exec.Command(
-				"yt-dlp",
-				"--no-playlist",
-				"--list-formats",
-				url,
-			)
+			if url == "" && i+1 < len(cliArgs) && strings.HasPrefix(cliArgs[i+1], "http") {
+				url = cliArgs[i+1]
+				i++
+			}
+			if url == "" {
+				fmt.Fprintln(os.Stderr, "Gleedos: --list-formats requires URL")
+				os.Exit(1)
+			}
+			cmd := exec.Command("yt-dlp", "--no-playlist", "--list-formats", url)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
-
 			if err := cmd.Run(); err != nil {
 				os.Exit(1)
 			}
 			return
+
+		default:
+			if strings.HasPrefix(cliArgs[i], "http://") || strings.HasPrefix(cliArgs[i], "https://") {
+				url = cliArgs[i]
+			}
 		}
 	}
 
-	if turbo {
-		// Kept intentionally conservative. YouTube throttling/403s
-		// are not fixed by blindly increasing fragment concurrency.
+	// Execute Batch Mode
+	if batchFile != "" {
+		urls, err := batch.ParseURLFile(batchFile)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Gleedos: failed to read batch file: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Print(banner)
+		fmt.Printf("  Batch file: %s (%d URLs)\n", batchFile, len(urls))
+		fmt.Printf("  Concurrency: %d workers\n", concurrency)
+		fmt.Printf("  Output directory: %s\n\n", outputDir)
+
+		sCount, fCount, _ := batch.ProcessBatch(
+			context.Background(),
+			urls,
+			concurrency,
+			store,
+			func(ctx context.Context, u string) (string, error) {
+				return downloadMedia(ctx, u, outputDir, audioMode, quality == "bv*+ba/b[ext=mp4]/b", turbo, preferredFormat, threads, rateLim, cookiesFile, cookiesBrowser, subLangs)
+			},
+		)
+
+		fmt.Printf("\nBatch complete! %d succeeded, %d failed.\n", sCount, fCount)
+		return
+	}
+
+	if url == "" {
+		fmt.Fprintln(os.Stderr, "Gleedos: invalid or missing URL")
+		os.Exit(1)
 	}
 
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
@@ -149,34 +328,87 @@ func main() {
 	fmt.Print(banner)
 	fmt.Printf("  URL: %s\n", url)
 	fmt.Printf("  Output: %s\n", outputDir)
-
 	if audioMode {
-		fmt.Println("  Mode: audio")
+		fmt.Println("  Mode: audio (MP3)")
 	} else {
 		fmt.Printf("  Quality: %s\n", quality)
 	}
-
 	fmt.Println()
 
-	template := filepath.Join(
-		outputDir,
-		"%(title)s [%(id)s].%(ext)s",
-	)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
-	/*
-		Important:
+	outPath, err := downloadMedia(ctx, url, outputDir, audioMode, quality == "bv*+ba/b[ext=mp4]/b", turbo, preferredFormat, threads, rateLim, cookiesFile, cookiesBrowser, subLangs)
+	if err != nil {
+		fmt.Println()
+		fmt.Println("========================================")
+		fmt.Println("       ✗ ALL DOWNLOAD ATTEMPTS FAILED")
+		fmt.Println("========================================")
+		fmt.Println()
+		fmt.Printf("Error: %v\n", err)
+		os.Exit(1)
+	}
 
-		Do NOT trust the global yt-dlp configuration to determine
-		the client for every attempt. Each fallback explicitly
-		chooses its own client.
+	info, statErr := os.Stat(outPath)
+	sizeStr := "unknown size"
+	if statErr == nil {
+		sizeStr = fmt.Sprintf("%d bytes", info.Size())
+	}
 
-		The user's current configuration uses mweb + BgUtils.
-		That successfully generates a PO token but the resulting
-		GVS media request is returning HTTP 403.
+	fmt.Println()
+	fmt.Println("========================================")
+	fmt.Println("       ✓ GLEEDOS DOWNLOAD COMPLETE")
+	fmt.Println("========================================")
+	fmt.Printf("  File: %s\n", outPath)
+	fmt.Printf("  Size: %s\n", sizeStr)
+	fmt.Println()
 
-		Therefore Gleedos tries genuinely different download paths.
-	*/
+	if store != nil {
+		_ = store.Record(batch.HistoryRecord{
+			URL:         url,
+			CompletedAt: time.Now(),
+			OutputPath:  outPath,
+			Success:     true,
+		})
+	}
+}
 
+func downloadMedia(
+	ctx context.Context,
+	url string,
+	outputDir string,
+	audioMode bool,
+	best bool,
+	turbo bool,
+	preferredFormat string,
+	threads int,
+	rateLim *limiter.RateLimiter,
+	cookiesFile string,
+	cookiesBrowser string,
+	subLangs string,
+) (string, error) {
+	// 1. Check if URL is a direct media file or direct HLS stream for zero-dependency download
+	if isNative, kind := isDirectNativeURL(url); isNative {
+		fmt.Printf("⚡ Executing zero-dependency pure-Go engine (%s stream)...\n", strings.ToUpper(kind))
+		path, err := runNativeDownload(ctx, url, outputDir, kind, threads, rateLim)
+		if err == nil {
+			// Validate file
+			if _, vErr := tagger.ValidateMediaFile(path); vErr == nil {
+				return path, nil
+			}
+		}
+	}
+
+	// 2. Platform / Fallback Matrix
+	quality := "bv*[height<=1080]+ba/b[height<=1080]/b[ext=mp4]/b"
+	if best {
+		quality = "bv*+ba/b[ext=mp4]/b"
+	}
+	if preferredFormat != "" {
+		quality = fmt.Sprintf("bv*[ext=%s]+ba/b[ext=%s]/b[ext=%s]", preferredFormat, preferredFormat, preferredFormat)
+	}
+
+	template := filepath.Join(outputDir, "%(title)s [%(id)s].%(ext)s")
 	base := []string{
 		"--newline",
 		"--progress",
@@ -190,14 +422,17 @@ func main() {
 		"-o", template,
 	}
 
-	attempts := buildDownloadStrategies(
-		base,
-		quality,
-		audioMode,
-		url,
-	)
+	if cookiesFile != "" {
+		base = append(base, "--cookies", cookiesFile)
+	}
+	if cookiesBrowser != "" {
+		base = append(base, "--cookies-from-browser", cookiesBrowser)
+	}
+	if subLangs != "" {
+		base = append(base, "--write-subs", "--sub-langs", subLangs)
+	}
 
-	success := false
+	attempts := buildDownloadStrategies(base, quality, audioMode, url)
 
 	for n, strategy := range attempts {
 		fmt.Println("========================================")
@@ -206,54 +441,21 @@ func main() {
 		fmt.Println()
 
 		before := snapshotOutput(outputDir)
-
 		err := runDownload(strategy)
-
 		if err != nil {
 			fmt.Printf("\n⚠ Attempt failed: %s\n\n", err)
 			continue
 		}
 
-		// yt-dlp may return zero while producing no usable file.
 		path := findCompletedOutput(before, outputDir)
-
 		if path != "" {
-			info, statErr := os.Stat(path)
-
-			if statErr != nil {
-				fmt.Printf(
-					"\n⚠ Completed output disappeared before stat: %s\n\n",
-					statErr,
-				)
-				continue
+			if _, statErr := os.Stat(path); statErr == nil {
+				return path, nil
 			}
-
-			fmt.Println()
-			fmt.Println("========================================")
-			fmt.Println("       ✓ GLEEDOS DOWNLOAD COMPLETE")
-			fmt.Println("========================================")
-			fmt.Printf("  File: %s\n", path)
-			fmt.Printf("  Size: %d bytes\n", info.Size())
-			fmt.Println()
-
-			success = true
-		}
-
-		if success {
-			break
 		}
 
 		fmt.Println("⚠ yt-dlp returned success but no new non-empty file was found.")
 	}
 
-	if !success {
-		fmt.Println()
-		fmt.Println("========================================")
-		fmt.Println("       ✗ ALL DOWNLOAD ATTEMPTS FAILED")
-		fmt.Println("========================================")
-		fmt.Println()
-		fmt.Println("Gleedos did not report a false success.")
-		fmt.Println("YouTube rejected every available download path.")
-		os.Exit(1)
-	}
+	return "", fmt.Errorf("all fallback download paths failed")
 }
