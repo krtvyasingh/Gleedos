@@ -9,20 +9,22 @@ import (
 	"time"
 )
 
-// ReadClipboard returns current clipboard text using native OS tools.
-func ReadClipboard() (string, error) {
+// ReadClipboard returns current clipboard text using native OS tools with a bounded timeout.
+func ReadClipboard(parentCtx context.Context) (string, error) {
+	ctx, cancel := context.WithTimeout(parentCtx, 2*time.Second)
+	defer cancel()
+
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "darwin":
-		cmd = exec.Command("pbpaste")
+		cmd = exec.CommandContext(ctx, "pbpaste")
 	case "windows":
-		cmd = exec.Command("powershell.exe", "-NoProfile", "-Command", "Get-Clipboard")
+		cmd = exec.CommandContext(ctx, "powershell.exe", "-NoProfile", "-NonInteractive", "-Command", "Get-Clipboard")
 	default:
-		// Linux: try xclip then xsel
 		if _, err := exec.LookPath("xclip"); err == nil {
-			cmd = exec.Command("xclip", "-selection", "clipboard", "-o")
+			cmd = exec.CommandContext(ctx, "xclip", "-selection", "clipboard", "-o")
 		} else if _, err := exec.LookPath("xsel"); err == nil {
-			cmd = exec.Command("xsel", "-b", "-o")
+			cmd = exec.CommandContext(ctx, "xsel", "-b", "-o")
 		} else {
 			return "", nil
 		}
@@ -103,7 +105,7 @@ func (w *Watcher) Start(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			text, err := ReadClipboard()
+			text, err := ReadClipboard(ctx)
 			if err != nil || text == "" {
 				continue
 			}
@@ -114,7 +116,6 @@ func (w *Watcher) Start(ctx context.Context) {
 
 			w.mu.Lock()
 			lastSeen, exists := w.seen[text]
-			// Avoid re-triggering if seen within last 10 minutes
 			if exists && time.Since(lastSeen) < 10*time.Minute {
 				w.mu.Unlock()
 				continue

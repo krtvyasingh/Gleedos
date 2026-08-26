@@ -3,8 +3,12 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -92,7 +96,7 @@ func New(port int, handler HandlerFunc, store *batch.HistoryStore) *Server {
 	}
 }
 
-// Start runs the HTTP server.
+// Start runs the HTTP server with hardened timeouts and handlers.
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
@@ -101,8 +105,13 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("/api/history", s.handleHistory)
 
 	s.httpSrv = &http.Server{
-		Addr:    fmt.Sprintf(":%d", s.port),
-		Handler: mux,
+		Addr:              fmt.Sprintf(":%d", s.port),
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       15 * time.Second,
+		WriteTimeout:      60 * time.Second,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
 	go func() {
@@ -121,23 +130,51 @@ func (s *Server) Start(ctx context.Context) error {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"status":  "ok",
 		"service": "gleedos-api",
 		"version": "2.0.0",
 	})
 }
 
+func validateRequestURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL syntax: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return errors.New("only http and https URLs are allowed")
+	}
+	if u.Host == "" {
+		return errors.New("URL missing host")
+	}
+	return nil
+}
+
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		http.Error(w, `{"error": "method not allowed"}`, http.StatusMethodNotAllowed)
 		return
 	}
 
+	// Restrict payload size to 1MB max to prevent memory exhaustion
+	r.Body = http.MaxBytesReader(w, r.Body, 1024*1024)
+
 	var req DownloadRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
-		http.Error(w, `{"error": "invalid request body or missing url"}`, http.StatusBadRequest)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, `{"error": "invalid request body"}`, http.StatusBadRequest)
 		return
+	}
+
+	req.URL = strings.TrimSpace(req.URL)
+	if err := validateRequestURL(req.URL); err != nil {
+		http.Error(w, fmt.Sprintf(`{"error": "%s"}`, err.Error()), http.StatusBadRequest)
+		return
+	}
+
+	if req.OutputPath != "" {
+		req.OutputPath = filepath.Clean(req.OutputPath)
 	}
 
 	jobID := fmt.Sprintf("job_%d", time.Now().UnixNano())
@@ -155,6 +192,15 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	response := job.Response()
 
 	go func() {
+		defer func() {
+			if r := recover(); r != nil {
+				job.mu.Lock()
+				job.Status = StatusFailed
+				job.Error = fmt.Sprintf("internal worker panic: %v", r)
+				job.mu.Unlock()
+			}
+		}()
+
 		job.mu.Lock()
 		job.Status = StatusDownloading
 		job.mu.Unlock()
@@ -187,7 +233,7 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusAccepted)
-	json.NewEncoder(w).Encode(response)
+	_ = json.NewEncoder(w).Encode(response)
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -207,14 +253,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(job.Response())
+	_ = json.NewEncoder(w).Encode(job.Response())
 }
 
 func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	if s.store == nil {
-		json.NewEncoder(w).Encode([]batch.HistoryRecord{})
+		_ = json.NewEncoder(w).Encode([]batch.HistoryRecord{})
 		return
 	}
-	json.NewEncoder(w).Encode(s.store.GetAll())
+	_ = json.NewEncoder(w).Encode(s.store.GetAll())
 }

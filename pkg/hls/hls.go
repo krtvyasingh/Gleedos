@@ -3,9 +3,11 @@ package hls
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -35,7 +37,7 @@ type Playlist struct {
 
 // ParsePlaylist parses M3U8 playlist content.
 func ParsePlaylist(baseURL *url.URL, r io.Reader) (*Playlist, error) {
-	scanner := bufio.NewScanner(r)
+	scanner := bufio.NewScanner(io.LimitReader(r, 10*1024*1024))
 	p := &Playlist{}
 
 	var currentDuration float64
@@ -65,7 +67,6 @@ func ParsePlaylist(baseURL *url.URL, r io.Reader) (*Playlist, error) {
 			continue
 		}
 
-		// Line is a URI
 		parsedURI, err := url.Parse(line)
 		if err != nil {
 			continue
@@ -109,13 +110,37 @@ type Downloader struct {
 	client *http.Client
 }
 
+func defaultTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
+}
+
 // New creates a new HLS Downloader.
 func New(cfg Config) *Downloader {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 5
 	}
+	if cfg.Concurrency > 32 {
+		cfg.Concurrency = 32
+	}
 	if cfg.Client == nil {
-		cfg.Client = &http.Client{Timeout: 30 * time.Second}
+		cfg.Client = &http.Client{
+			Transport: defaultTransport(),
+		}
 	}
 	return &Downloader{cfg: cfg, client: cfg.Client}
 }
@@ -125,7 +150,7 @@ func (d *Downloader) Download(ctx context.Context) error {
 	playlistURL := d.cfg.URL
 
 	// 1. Fetch Master or Media Playlist
-	playlist, resolvedURL, err := d.fetchPlaylist(ctx, playlistURL)
+	playlist, _, err := d.fetchPlaylist(ctx, playlistURL)
 	if err != nil {
 		return fmt.Errorf("fetch playlist: %w", err)
 	}
@@ -134,7 +159,6 @@ func (d *Downloader) Download(ctx context.Context) error {
 		if len(playlist.Variants) == 0 {
 			return errors.New("master playlist contains no variants")
 		}
-		// Pick highest bandwidth / last variant
 		variantURL := playlist.Variants[len(playlist.Variants)-1]
 		playlist, _, err = d.fetchPlaylist(ctx, variantURL)
 		if err != nil {
@@ -146,11 +170,9 @@ func (d *Downloader) Download(ctx context.Context) error {
 		return errors.New("no media segments found in playlist")
 	}
 
-	_ = resolvedURL
-
 	// 2. Prepare staging directory for temporary segments
 	stagingDir := d.cfg.TargetPath + ".hls_parts"
-	if err := os.MkdirAll(stagingDir, 0755); err != nil {
+	if err := os.MkdirAll(stagingDir, 0700); err != nil {
 		return fmt.Errorf("mkdir staging: %w", err)
 	}
 	defer os.RemoveAll(stagingDir)
@@ -229,7 +251,7 @@ func (d *Downloader) Download(ctx context.Context) error {
 			return fmt.Errorf("open segment %d: %w", i, err)
 		}
 		_, copyErr := io.Copy(outFile, partFile)
-		partFile.Close()
+		_ = partFile.Close()
 		if copyErr != nil {
 			return fmt.Errorf("merge segment %d: %w", i, copyErr)
 		}
@@ -262,7 +284,7 @@ func (d *Downloader) fetchPlaylist(ctx context.Context, u string) (*Playlist, *u
 		return nil, nil, err
 	}
 
-	p, err := ParsePlaylist(base, resp.Body)
+	p, err := ParsePlaylist(base, io.LimitReader(resp.Body, 10*1024*1024))
 	return p, base, err
 }
 
@@ -285,7 +307,7 @@ func (d *Downloader) downloadSegment(ctx context.Context, segURL, outPath string
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			lastErr = fmt.Errorf("status %s", resp.Status)
 			time.Sleep(time.Duration(attempt+1) * 100 * time.Millisecond)
 			continue
@@ -293,14 +315,14 @@ func (d *Downloader) downloadSegment(ctx context.Context, segURL, outPath string
 
 		f, err := os.Create(outPath)
 		if err != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 			return err
 		}
 
 		r := limiter.NewReader(ctx, resp.Body, d.cfg.RateLimiter)
 		_, copyErr := io.Copy(f, r)
-		f.Close()
-		resp.Body.Close()
+		_ = f.Close()
+		_ = resp.Body.Close()
 
 		if copyErr == nil {
 			return nil

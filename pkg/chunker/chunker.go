@@ -2,13 +2,17 @@ package chunker
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,11 +22,11 @@ import (
 
 // Chunk represents a discrete byte range in a download.
 type Chunk struct {
-	Index       int   `json:"index"`
-	Start       int64 `json:"start"`
-	End         int64 `json:"end"`
-	Downloaded  int64 `json:"downloaded"`
-	Completed   bool  `json:"completed"`
+	Index      int   `json:"index"`
+	Start      int64 `json:"start"`
+	End        int64 `json:"end"`
+	Downloaded int64 `json:"downloaded"`
+	Completed  bool  `json:"completed"`
 }
 
 // DownloadMeta contains checkpoint data for resuming downloads.
@@ -48,12 +52,32 @@ type Config struct {
 
 // Downloader manages parallel chunked downloading.
 type Downloader struct {
-	cfg        Config
-	client     *http.Client
-	metaPath   string
-	meta       *DownloadMeta
-	mu         sync.Mutex
-	tracker    *ui.ProgressTracker
+	cfg      Config
+	client   *http.Client
+	metaPath string
+	meta     *DownloadMeta
+	mu       sync.Mutex
+	tracker  *ui.ProgressTracker
+}
+
+// defaultTransport provides secure and robust connection timeouts.
+func defaultTransport() *http.Transport {
+	return &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   10 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		},
+	}
 }
 
 // New creates a new Downloader.
@@ -61,9 +85,12 @@ func New(cfg Config) *Downloader {
 	if cfg.Concurrency <= 0 {
 		cfg.Concurrency = 4
 	}
+	if cfg.Concurrency > 32 {
+		cfg.Concurrency = 32 // Prevent excessive connection abuse
+	}
 	if cfg.Client == nil {
 		cfg.Client = &http.Client{
-			Timeout: 30 * time.Second,
+			Transport: defaultTransport(),
 		}
 	}
 	metaPath := cfg.TargetPath + ".gleedos.meta"
@@ -74,8 +101,28 @@ func New(cfg Config) *Downloader {
 	}
 }
 
+// validateURL ensures the URL is syntactically valid and uses HTTP/HTTPS.
+func validateURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL syntax: %w", err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("unsupported protocol scheme: %s (only http and https allowed)", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("URL missing host")
+	}
+	return nil
+}
+
 // Download starts or resumes the parallel chunked download.
 func (d *Downloader) Download(ctx context.Context) error {
+	if err := validateURL(d.cfg.URL); err != nil {
+		return err
+	}
+
 	req, err := http.NewRequestWithContext(ctx, "HEAD", d.cfg.URL, nil)
 	if err != nil {
 		return fmt.Errorf("create HEAD request: %w", err)
@@ -85,20 +132,26 @@ func (d *Downloader) Download(ctx context.Context) error {
 	}
 
 	resp, err := d.client.Do(req)
+	var probeResp *http.Response
+
 	if err != nil || resp.StatusCode >= 400 {
+		if resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
 		// Try GET with Range 0-0 fallback
-		req, err = http.NewRequestWithContext(ctx, "GET", d.cfg.URL, nil)
-		if err != nil {
-			return fmt.Errorf("create probe GET request: %w", err)
+		probeReq, pErr := http.NewRequestWithContext(ctx, "GET", d.cfg.URL, nil)
+		if pErr != nil {
+			return fmt.Errorf("create probe GET request: %w", pErr)
 		}
 		for k, v := range d.cfg.Headers {
-			req.Header.Set(k, v)
+			probeReq.Header.Set(k, v)
 		}
-		req.Header.Set("Range", "bytes=0-0")
-		resp, err = d.client.Do(req)
+		probeReq.Header.Set("Range", "bytes=0-0")
+		probeResp, err = d.client.Do(probeReq)
 		if err != nil {
 			return fmt.Errorf("probe request failed: %w", err)
 		}
+		resp = probeResp
 	}
 	defer resp.Body.Close()
 
@@ -194,7 +247,7 @@ func (d *Downloader) downloadSingleStream(ctx context.Context) error {
 
 	tracker.PrintProgress()
 	tracker.Finish()
-	outFile.Close()
+	_ = outFile.Close()
 
 	return os.Rename(tmpFile, d.cfg.TargetPath)
 }
@@ -213,7 +266,6 @@ func (d *Downloader) loadOrCreateMeta(contentLength int64, etag, lastMod string)
 	// Create new chunk plan
 	chunkSize := contentLength / int64(d.cfg.Concurrency)
 	if chunkSize < 512*1024 {
-		// Minimum 512KB chunk
 		chunkSize = 512 * 1024
 	}
 
@@ -255,7 +307,11 @@ func (d *Downloader) saveMeta() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(d.metaPath, data, 0644)
+	tmpMeta := d.metaPath + ".tmp"
+	if err := os.WriteFile(tmpMeta, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpMeta, d.metaPath)
 }
 
 func (d *Downloader) downloadParallel(ctx context.Context, contentLength int64, etag, lastMod string) error {
@@ -263,7 +319,6 @@ func (d *Downloader) downloadParallel(ctx context.Context, contentLength int64, 
 		return fmt.Errorf("init meta: %w", err)
 	}
 
-	// Allocate target file if not exists
 	file, err := os.OpenFile(d.cfg.TargetPath, os.O_CREATE|os.O_RDWR, 0644)
 	if err != nil {
 		return fmt.Errorf("open target file: %w", err)
@@ -271,7 +326,9 @@ func (d *Downloader) downloadParallel(ctx context.Context, contentLength int64, 
 	defer file.Close()
 
 	if stat, err := file.Stat(); err == nil && stat.Size() < contentLength {
-		_ = file.Truncate(contentLength)
+		if tErr := file.Truncate(contentLength); tErr != nil {
+			return fmt.Errorf("pre-allocate file space: %w", tErr)
+		}
 	}
 
 	var totalInitialDownloaded int64
@@ -339,7 +396,6 @@ func (d *Downloader) downloadParallel(ctx context.Context, contentLength int64, 
 	tracker.PrintProgress()
 	tracker.Finish()
 
-	// Verify all chunks completed
 	allDone := true
 	for _, ch := range d.meta.Chunks {
 		if !ch.Completed {

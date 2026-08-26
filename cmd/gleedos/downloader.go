@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/krtvysingh/gleedos/pkg/chunker"
@@ -21,6 +22,24 @@ func runDownload(strategy downloadStrategy) error {
 	cmd.Stderr = os.Stderr
 
 	return cmd.Run()
+}
+
+// sanitizeFilename strips dangerous characters and path separators from filenames.
+func sanitizeFilename(name string) string {
+	name = filepath.Base(name)
+	name = strings.TrimSpace(name)
+	if name == "" || name == "." || name == "/" || name == "\\" {
+		return "download"
+	}
+
+	// Remove control characters and characters unsafe on Unix/Windows
+	reg := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1F]`)
+	cleaned := reg.ReplaceAllString(name, "_")
+	cleaned = strings.Trim(cleaned, ". ")
+	if cleaned == "" {
+		return "download"
+	}
+	return cleaned
 }
 
 // isDirectNativeURL checks if the URL is a direct media file or HLS stream suitable for zero-dependency download.
@@ -59,10 +78,9 @@ func runNativeDownload(
 	}
 
 	parsed, _ := url.Parse(mediaURL)
-	filename := filepath.Base(parsed.Path)
-	if filename == "" || filename == "/" || filename == "." {
-		filename = "download"
-	}
+	rawName := filepath.Base(parsed.Path)
+	filename := sanitizeFilename(rawName)
+
 	if kind == "hls" && !strings.HasSuffix(strings.ToLower(filename), ".ts") && !strings.HasSuffix(strings.ToLower(filename), ".mp4") {
 		filename = strings.TrimSuffix(filename, filepath.Ext(filename)) + ".ts"
 	}

@@ -82,11 +82,23 @@ type Metadata struct {
 	Comment string
 }
 
-// InjectID3Tag prepends an ID3v2.3 tag with Title, Artist, and Comment to an MP3 file.
+// InjectID3Tag prepends an ID3v2.3 tag with Title, Artist, and Comment to an MP3 file, cleanly replacing any prior ID3 header.
 func InjectID3Tag(filePath string, meta Metadata) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return err
+	}
+
+	// Strip existing ID3v2 header if present to avoid nested/corrupted tag headers
+	if len(data) >= 10 && string(data[:3]) == "ID3" {
+		oldTagSize := (int(data[6]&0x7F) << 21) |
+			(int(data[7]&0x7F) << 14) |
+			(int(data[8]&0x7F) << 7) |
+			int(data[9]&0x7F)
+		totalOldHeader := 10 + oldTagSize
+		if len(data) >= totalOldHeader {
+			data = data[totalOldHeader:]
+		}
 	}
 
 	// Build ID3v2.3 tag buffer
@@ -113,7 +125,6 @@ func InjectID3Tag(filePath string, meta Metadata) error {
 	addFrame("TIT2", meta.Title)
 	addFrame("TPE1", meta.Artist)
 	if meta.Comment != "" {
-		// COMM frame: 1 byte encoding, 3 bytes lang ('eng'), 1 byte short desc (0x00), comment text
 		commBody := append([]byte{0x00, 'e', 'n', 'g', 0x00}, []byte(meta.Comment)...)
 		frames.WriteString("COMM")
 		sz := len(commBody)
@@ -140,7 +151,10 @@ func InjectID3Tag(filePath string, meta Metadata) error {
 	id3Header.WriteByte(byte(tagLen & 0x7F))
 	id3Header.Write(tagPayload)
 
-	// Prepend tag to existing file data
 	newData := append(id3Header.Bytes(), data...)
-	return os.WriteFile(filePath, newData, 0644)
+	tmpFile := filePath + ".id3tmp"
+	if err := os.WriteFile(tmpFile, newData, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpFile, filePath)
 }

@@ -27,7 +27,7 @@ type HistoryStore struct {
 	mu       sync.RWMutex
 }
 
-// NewHistoryStore initializes the history store.
+// NewHistoryStore initializes the history store with secure file permissions.
 func NewHistoryStore(customPath string) (*HistoryStore, error) {
 	path := customPath
 	if path == "" {
@@ -39,7 +39,7 @@ func NewHistoryStore(customPath string) (*HistoryStore, error) {
 	}
 
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, err
 	}
 
@@ -68,7 +68,7 @@ func (h *HistoryStore) HasURL(u string) bool {
 	return exists && rec.Success
 }
 
-// Record saves a download outcome.
+// Record saves a download outcome atomically.
 func (h *HistoryStore) Record(rec HistoryRecord) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -85,7 +85,11 @@ func (h *HistoryStore) Record(rec HistoryRecord) error {
 		return err
 	}
 
-	return os.WriteFile(h.filePath, data, 0644)
+	tmpPath := h.filePath + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0600); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, h.filePath)
 }
 
 // GetAll returns all history records.

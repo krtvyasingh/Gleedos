@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -57,6 +59,30 @@ Options:
 `)
 }
 
+var alphaNumReg = regexp.MustCompile(`^[a-zA-Z0-9_-]+$`)
+var langReg = regexp.MustCompile(`^[a-zA-Z0-9_,-]+$`)
+
+func isValidBrowser(b string) bool {
+	valid := map[string]bool{
+		"chrome": true, "safari": true, "firefox": true,
+		"edge": true, "brave": true, "opera": true,
+		"vivaldi": true, "chromium": true,
+	}
+	return valid[strings.ToLower(strings.TrimSpace(b))]
+}
+
+func isValidURL(rawURL string) bool {
+	if strings.HasPrefix(rawURL, "-") {
+		return false
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	scheme := strings.ToLower(u.Scheme)
+	return scheme == "http" || scheme == "https"
+}
+
 func main() {
 	cliArgs := os.Args[1:]
 
@@ -104,7 +130,7 @@ func main() {
 		for i := 1; i < len(cliArgs); i++ {
 			if cliArgs[i] == "--port" && i+1 < len(cliArgs) {
 				p, _ := strconv.Atoi(cliArgs[i+1])
-				if p > 0 {
+				if p > 0 && p <= 65535 {
 					port = p
 				}
 				i++
@@ -166,7 +192,7 @@ func main() {
 		return
 	}
 
-	// Batch Mode
+	// Batch Mode & Main CLI Parsing
 	var batchFile string
 	outputDir := filepath.Join(home, "Downloads", "Gleedos")
 	quality := "bv*[height<=1080]+ba/b[height<=1080]/b[ext=mp4]/b"
@@ -205,18 +231,18 @@ func main() {
 		case "--threads":
 			if i+1 < len(cliArgs) {
 				i++
-				threads, _ = strconv.Atoi(cliArgs[i])
-				if threads <= 0 {
-					threads = 4
+				t, _ := strconv.Atoi(cliArgs[i])
+				if t > 0 && t <= 32 {
+					threads = t
 				}
 			}
 
 		case "-j", "--concurrency":
 			if i+1 < len(cliArgs) {
 				i++
-				concurrency, _ = strconv.Atoi(cliArgs[i])
-				if concurrency <= 0 {
-					concurrency = 3
+				c, _ := strconv.Atoi(cliArgs[i])
+				if c > 0 && c <= 16 {
+					concurrency = c
 				}
 			}
 
@@ -238,13 +264,22 @@ func main() {
 		case "--cookies-from-browser":
 			if i+1 < len(cliArgs) {
 				i++
-				cookiesBrowser = cliArgs[i]
+				b := cliArgs[i]
+				if isValidBrowser(b) {
+					cookiesBrowser = b
+				} else {
+					fmt.Fprintf(os.Stderr, "Gleedos: unsupported browser %q\n", b)
+					os.Exit(1)
+				}
 			}
 
 		case "--subs":
 			if i+1 < len(cliArgs) {
 				i++
-				subLangs = cliArgs[i]
+				s := cliArgs[i]
+				if langReg.MatchString(s) {
+					subLangs = s
+				}
 			}
 
 		case "--format":
@@ -253,8 +288,11 @@ func main() {
 				os.Exit(1)
 			}
 			i++
-			preferredFormat = cliArgs[i]
-			quality = fmt.Sprintf("bv*[ext=%s]+ba/b[ext=%s]/b[ext=%s]", preferredFormat, preferredFormat, preferredFormat)
+			fmtVal := cliArgs[i]
+			if alphaNumReg.MatchString(fmtVal) {
+				preferredFormat = fmtVal
+				quality = fmt.Sprintf("bv*[ext=%s]+ba/b[ext=%s]/b[ext=%s]", preferredFormat, preferredFormat, preferredFormat)
+			}
 
 		case "-o", "--output":
 			if i+1 >= len(cliArgs) {
@@ -269,11 +307,11 @@ func main() {
 				url = cliArgs[i+1]
 				i++
 			}
-			if url == "" {
-				fmt.Fprintln(os.Stderr, "Gleedos: --list-formats requires URL")
+			if url == "" || !isValidURL(url) {
+				fmt.Fprintln(os.Stderr, "Gleedos: --list-formats requires a valid URL")
 				os.Exit(1)
 			}
-			cmd := exec.Command("yt-dlp", "--no-playlist", "--list-formats", url)
+			cmd := exec.Command("yt-dlp", "--no-playlist", "--list-formats", "--", url)
 			cmd.Stdout = os.Stdout
 			cmd.Stderr = os.Stderr
 			if err := cmd.Run(); err != nil {
@@ -315,7 +353,7 @@ func main() {
 		return
 	}
 
-	if url == "" {
+	if url == "" || !isValidURL(url) {
 		fmt.Fprintln(os.Stderr, "Gleedos: invalid or missing URL")
 		os.Exit(1)
 	}
@@ -392,7 +430,6 @@ func downloadMedia(
 		fmt.Printf("⚡ Executing zero-dependency pure-Go engine (%s stream)...\n", strings.ToUpper(kind))
 		path, err := runNativeDownload(ctx, url, outputDir, kind, threads, rateLim)
 		if err == nil {
-			// Validate file
 			if _, vErr := tagger.ValidateMediaFile(path); vErr == nil {
 				return path, nil
 			}
