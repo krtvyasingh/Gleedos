@@ -1,7 +1,5 @@
 package spatial
 
-import "math"
-
 func CalculateDistanceGain(distanceMeters, referenceDistance, maxDistance float64) float64 {
 	if distanceMeters <= referenceDistance {
 		return 1.0
