@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
   push:
     branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
   benchmark:
-    runs-on:
-  workflow_dispatch: ubuntu-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version:
-  workflow_dispatch: '1.22'
+          go-version: '1.23'
       - name: Run Benchmarks
-        run: go test -bench=. ./...
+        run: go test -bench=. -benchmem ./...
